@@ -57,7 +57,7 @@ The denominator is the **tissue spanned by the knife slab**, not the 6 × 6 × 0
 - **Target region**: (slab ∩ target) / (slab ∩ cube), also shown as absolute mm³
 - **Nothingness**: 0% of this cut (empty space outside the block is not collected)
 
-The table of consecutive cuts, and the graph under the 3D view, list every serial slab through the tissue at the current knife orientation. The graph Y-axis is **percentage of the whole target cuboid** that lies in that cut. Parallel stacks are near zero until they reach the target layer, then spike. Face-on perpendicular stacks are almost flat. A 45° rotation about Z makes a longer cut through the layer, so the middle of that stack is higher.
+The table of consecutive cuts, and the graph under the 3D view, list every serial slab through the tissue at the current knife orientation. The graph Y-axis is **absolute target volume in that cut (mm³)**. Parallel stacks are near zero until they reach the target layer, then spike. Face-on perpendicular stacks are almost flat. A 45° rotation about Z makes a longer cut through the layer, so the middle of that stack is higher.
 
 Changing display X or Y must not change any of these numbers.
 

@@ -215,37 +215,37 @@ def build_stack_figure(stack) -> go.Figure:
     fig = go.Figure()
     if stack:
         xs = [c.number for c in stack]
-        ys = [c.pct_of_target for c in stack]
+        ys = [c.target_volume for c in stack]
         fig.add_bar(
             x=xs,
             y=ys,
-            name="% of target cuboid",
+            name="Target volume",
             marker=dict(color="#93c5fd"),
-            hovertemplate="Section %{x}<br>%{y:.3f}% of target<extra></extra>",
+            hovertemplate="Section %{x}<br>%{y:.4f} mm³ of target<extra></extra>",
         )
         current = next((c for c in stack if c.is_current), None)
         if current is not None:
             fig.add_scatter(
                 x=[current.number],
-                y=[current.pct_of_target],
+                y=[current.target_volume],
                 mode="markers",
                 marker=dict(size=11, color="#dc2626"),
                 name="This cut",
-                hovertemplate="This cut (section %{x})<br>%{y:.3f}% of target<extra></extra>",
+                hovertemplate="This cut (section %{x})<br>%{y:.4f} mm³ of target<extra></extra>",
             )
     fig.update_layout(
         margin=dict(l=48, r=16, t=40, b=44),
         paper_bgcolor="#f8fafc",
         plot_bgcolor="#f8fafc",
         title=dict(
-            text="Target cuboid captured in each consecutive cut",
+            text="Target volume in each consecutive cut",
             font=dict(size=14),
         ),
         xaxis=dict(title="Consecutive section number (along knife normal)", dtick=1, gridcolor="#e2e8f0"),
         yaxis=dict(
-            title="% of target cuboid in that cut",
+            title="Target volume in that cut (mm³)",
             rangemode="tozero",
-            ticksuffix="%",
+            ticksuffix=" mm³",
             gridcolor="#e2e8f0",
         ),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=11)),
@@ -398,7 +398,7 @@ app.layout = html.Div(
                         html.H2("Consecutive cuts along the knife normal"),
                         html.P(
                             "The graph under the 3D view shows every serial cut through the tissue at this orientation. "
-                            "Y is the percentage of the whole target cuboid that lies in that tissue-clipped slab. "
+                            "Y is the absolute volume of the target region inside that tissue-clipped slab (mm³). "
                             "Parallel cuts stay near zero until they reach the target layer, then spike. "
                             "Face-on perpendicular cuts are almost flat. A 45° rotation about Z lengthens the cut "
                             "through the layer, so the middle of that stack is higher; it is not perfectly flat, "
@@ -672,14 +672,14 @@ def update_scene(*values):
     if best is not None:
         extra.append(
             html.Div(
-                f"Largest target in this serial stack: {best.pct_of_target:.3f}% of the target cuboid "
-                f"({best.target_volume:.4f} mm³) in consecutive section {best.number}."
+                f"Largest target in this serial stack: {best.target_volume:.4f} mm³ "
+                f"in consecutive section {best.number}."
             )
         )
         extra.append(
             html.Div(
-                f"Sum over the stack: {sum(c.pct_of_target for c in stack):.2f}% of the target "
-                "(should be 100% if the stack covers the whole target)."
+                f"Sum of target volume over the stack: {sum(c.target_volume for c in stack):.4f} mm³ "
+                f"(the full target is {volumes.target_block:.4f} mm³)."
             )
         )
     stack_table = html.Table(
@@ -688,7 +688,6 @@ def update_scene(*values):
                 html.Tr(
                     [
                         html.Th("#"),
-                        html.Th("% of target cuboid"),
                         html.Th("Target (mm³)"),
                         html.Th("Tissue in cut (mm³)"),
                     ]
@@ -699,7 +698,6 @@ def update_scene(*values):
                     html.Tr(
                         [
                             html.Td(f"{c.number}" + (" (this cut)" if c.is_current else "")),
-                            html.Td(f"{c.pct_of_target:.3f}%"),
                             html.Td(f"{c.target_volume:.4f}"),
                             html.Td(f"{c.tissue_volume:.4f}"),
                         ],

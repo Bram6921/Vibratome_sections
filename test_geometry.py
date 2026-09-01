@@ -136,11 +136,11 @@ def test_parallel_stack_is_zero_then_spike() -> None:
         rz=0,
         pivot=(0.0, 0.0, 0.0),
     )
-    percents = [c.pct_of_target for c in cuts]
-    assert len(percents) >= 20
-    assert percents[0] < 1.0
-    assert max(percents) > 40.0
-    assert percents.index(max(percents)) > 5
+    vols = [c.target_volume for c in cuts]
+    assert len(vols) >= 20
+    assert vols[0] < 0.02
+    assert max(vols) > 0.4
+    assert vols.index(max(vols)) > 5
 
 
 def test_diagonal_perpendicular_captures_more_than_face() -> None:
@@ -164,7 +164,7 @@ def test_diagonal_perpendicular_captures_more_than_face() -> None:
         rz=45,
         pivot=(0.0, 0.0, 0.0),
     )
-    assert max(c.pct_of_target for c in diag) > max(c.pct_of_target for c in face) + 0.5
+    assert max(c.target_volume for c in diag) > max(c.target_volume for c in face) + 0.01
 
 
 if __name__ == "__main__":
