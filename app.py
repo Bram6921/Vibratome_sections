@@ -211,6 +211,49 @@ def build_figure(tissue: OrientedBox, target: OrientedBox | None, section: Orien
     return fig
 
 
+def build_stack_figure(stack) -> go.Figure:
+    fig = go.Figure()
+    if stack:
+        xs = [c.number for c in stack]
+        ys = [c.pct_of_target for c in stack]
+        fig.add_bar(
+            x=xs,
+            y=ys,
+            name="% of target cuboid",
+            marker=dict(color="#93c5fd"),
+            hovertemplate="Section %{x}<br>%{y:.3f}% of target<extra></extra>",
+        )
+        current = next((c for c in stack if c.is_current), None)
+        if current is not None:
+            fig.add_scatter(
+                x=[current.number],
+                y=[current.pct_of_target],
+                mode="markers",
+                marker=dict(size=11, color="#dc2626"),
+                name="This cut",
+                hovertemplate="This cut (section %{x})<br>%{y:.3f}% of target<extra></extra>",
+            )
+    fig.update_layout(
+        margin=dict(l=48, r=16, t=40, b=44),
+        paper_bgcolor="#f8fafc",
+        plot_bgcolor="#f8fafc",
+        title=dict(
+            text="Target cuboid captured in each consecutive cut",
+            font=dict(size=14),
+        ),
+        xaxis=dict(title="Consecutive section number (along knife normal)", dtick=1, gridcolor="#e2e8f0"),
+        yaxis=dict(
+            title="% of target cuboid in that cut",
+            rangemode="tozero",
+            ticksuffix="%",
+            gridcolor="#e2e8f0",
+        ),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=11)),
+        bargap=0.12,
+    )
+    return fig
+
+
 def _slider_input(control_id: str, label: str, unit: str, vmin: float, vmax: float,
                   step: float, value: float) -> html.Div:
     return html.Div(
@@ -282,7 +325,10 @@ app.layout = html.Div(
             children=[
                 html.Div(
                     className="scene-pane",
-                    children=[dcc.Graph(id="scene", figure=go.Figure(), style={"height": "100%"})],
+                    children=[
+                        dcc.Graph(id="scene", figure=go.Figure(), style={"height": "58%"}),
+                        dcc.Graph(id="stack-graph", figure=go.Figure(), style={"height": "42%"}),
+                    ],
                 ),
                 html.Div(
                     className="side-pane",
@@ -293,6 +339,7 @@ app.layout = html.Div(
                                 html.Button("Reset defaults", id="preset-default", n_clicks=0),
                                 html.Button("Perpendicular (Rx=90°)", id="preset-perp-x", n_clicks=0),
                                 html.Button("Perpendicular (Ry=90°)", id="preset-perp-y", n_clicks=0),
+                                html.Button("Perpendicular + 45° in Z", id="preset-perp-z45", n_clicks=0),
                                 html.Button("Oblique 45°", id="preset-oblique", n_clicks=0),
                                 html.Button("Pivot on target", id="preset-pivot-target", n_clicks=0),
                                 html.Button("Pivot at cube centre", id="preset-pivot-centre", n_clicks=0),
@@ -350,8 +397,12 @@ app.layout = html.Div(
                         ),
                         html.H2("Consecutive cuts along the knife normal"),
                         html.P(
-                            "Same orientation, mid-planes spaced by one knife thickness. "
-                            "This cut is k = 0. Target mm³ is the absolute volume in that slab.",
+                            "The graph under the 3D view shows every serial cut through the tissue at this orientation. "
+                            "Y is the percentage of the whole target cuboid that lies in that tissue-clipped slab. "
+                            "Parallel cuts stay near zero until they reach the target layer, then spike. "
+                            "Face-on perpendicular cuts are almost flat. A 45° rotation about Z lengthens the cut "
+                            "through the layer, so the middle of that stack is higher; it is not perfectly flat, "
+                            "because the chord through the square is shorter near the corners.",
                             className="hint",
                         ),
                         html.Div(id="stack-table"),
@@ -389,7 +440,9 @@ app.index_string = """
   .main { flex: 1; display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(340px, 0.9fr);
     gap: 14px; padding: 8px 16px 16px; min-height: 0; }
   .scene-pane { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
-    min-height: 72vh; overflow: hidden; }
+    min-height: 72vh; overflow: hidden; display: flex; flex-direction: column; }
+  #scene { flex: 1.3; min-height: 360px; }
+  #stack-graph { flex: 0.95; min-height: 250px; border-top: 1px solid var(--line); }
   .side-pane { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
     padding: 12px 14px 18px; overflow: auto; max-height: calc(100vh - 110px); }
   .side-pane h2 { margin: 16px 0 8px; font-size: 13px; letter-spacing: 0.04em;
@@ -496,16 +549,20 @@ def apply_default_preset(_n):
     _angle_outputs(),
     Input("preset-perp-x", "n_clicks"),
     Input("preset-perp-y", "n_clicks"),
+    Input("preset-perp-z45", "n_clicks"),
     Input("preset-oblique", "n_clicks"),
     prevent_initial_call=True,
 )
-def apply_angle_preset(_x, _y, _o):
+def apply_angle_preset(_x, _y, _z45, _o):
     triggered = callback_context.triggered_id
     rx, ry, rz = 0.0, 0.0, 0.0
     if triggered == "preset-perp-x":
         rx = 90.0
     elif triggered == "preset-perp-y":
         ry = 90.0
+    elif triggered == "preset-perp-z45":
+        rx = 90.0
+        rz = 45.0
     elif triggered == "preset-oblique":
         rx = 45.0
     return rx, ry, rz, rx, ry, rz
@@ -569,6 +626,7 @@ def step_along_knife_normal(_neg, _pos, px, py, pz, thickness, rx, ry, rz):
     Output("detail-empty", "children"),
     Output("extra-metrics", "children"),
     Output("stack-table", "children"),
+    Output("stack-graph", "figure"),
     [Input(f"{c[0]}-slider", "value") for c in CONTROLS],
 )
 def update_scene(*values):
@@ -585,6 +643,7 @@ def update_scene(*values):
     )
     pivot = np.array([params["pivot_x"], params["pivot_y"], params["pivot_z"]])
     fig = build_figure(tissue, target, section, overlap_pts, tissue_cut_pts, pivot)
+    stack_fig = build_stack_figure(stack)
 
     tissue_detail = (
         f"{volumes.tissue_in_section:.4f} mm³ of tissue in this cut  ·  "
@@ -613,18 +672,34 @@ def update_scene(*values):
     if best is not None:
         extra.append(
             html.Div(
-                f"In this consecutive stack, the largest target in any one cut is {best.target_volume:.4f} mm³ "
-                f"(k = {best.index:+d}). This cut has {volumes.target_in_section:.4f} mm³."
+                f"Largest target in this serial stack: {best.pct_of_target:.3f}% of the target cuboid "
+                f"({best.target_volume:.4f} mm³) in consecutive section {best.number}."
+            )
+        )
+        extra.append(
+            html.Div(
+                f"Sum over the stack: {sum(c.pct_of_target for c in stack):.2f}% of the target "
+                "(should be 100% if the stack covers the whole target)."
             )
         )
     stack_table = html.Table(
         [
-            html.Thead(html.Tr([html.Th("Cut"), html.Th("Target (mm³)"), html.Th("Tissue (mm³)")])),
+            html.Thead(
+                html.Tr(
+                    [
+                        html.Th("#"),
+                        html.Th("% of target cuboid"),
+                        html.Th("Target (mm³)"),
+                        html.Th("Tissue in cut (mm³)"),
+                    ]
+                )
+            ),
             html.Tbody(
                 [
                     html.Tr(
                         [
-                            html.Td("this cut" if c.is_current else f"k = {c.index:+d}"),
+                            html.Td(f"{c.number}" + (" (this cut)" if c.is_current else "")),
+                            html.Td(f"{c.pct_of_target:.3f}%"),
                             html.Td(f"{c.target_volume:.4f}"),
                             html.Td(f"{c.tissue_volume:.4f}"),
                         ],
@@ -646,6 +721,7 @@ def update_scene(*values):
         empty_detail,
         extra,
         stack_table,
+        stack_fig,
     )
 
 

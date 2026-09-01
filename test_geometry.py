@@ -111,7 +111,6 @@ def test_consecutive_steps_along_knife_normal() -> None:
     current = next(c for c in cuts if c.is_current)
     neighbor = next(c for c in cuts if c.index == 1)
     nearly(neighbor.midplane - current.midplane, t)
-    # Stepping the pivot by t along n must reproduce the neighbour cut.
     moved = np.array([0.0, 0.0, 0.0]) + t * n
     vols, *_ = compute_volumes(
         cube_size=(3, 3, 3),
@@ -126,6 +125,48 @@ def test_consecutive_steps_along_knife_normal() -> None:
     nearly(vols.target_in_section, neighbor.target_volume)
 
 
+def test_parallel_stack_is_zero_then_spike() -> None:
+    cuts = consecutive_cuts(
+        cube_size=(3, 3, 3),
+        target_size=(3, 3, 0.2),
+        depth_from_top=0.1,
+        thickness=0.1,
+        rx=0,
+        ry=0,
+        rz=0,
+        pivot=(0.0, 0.0, 0.0),
+    )
+    percents = [c.pct_of_target for c in cuts]
+    assert len(percents) >= 20
+    assert percents[0] < 1.0
+    assert max(percents) > 40.0
+    assert percents.index(max(percents)) > 5
+
+
+def test_diagonal_perpendicular_captures_more_than_face() -> None:
+    face = consecutive_cuts(
+        cube_size=(3, 3, 3),
+        target_size=(3, 3, 0.2),
+        depth_from_top=0.1,
+        thickness=0.1,
+        rx=90,
+        ry=0,
+        rz=0,
+        pivot=(0.0, 0.0, 0.0),
+    )
+    diag = consecutive_cuts(
+        cube_size=(3, 3, 3),
+        target_size=(3, 3, 0.2),
+        depth_from_top=0.1,
+        thickness=0.1,
+        rx=90,
+        ry=0,
+        rz=45,
+        pivot=(0.0, 0.0, 0.0),
+    )
+    assert max(c.pct_of_target for c in diag) > max(c.pct_of_target for c in face) + 0.5
+
+
 if __name__ == "__main__":
     test_horizontal_through_centre()
     test_display_xy_does_not_change_volumes()
@@ -133,4 +174,6 @@ if __name__ == "__main__":
     test_perpendicular_ry()
     test_horizontal_on_target()
     test_consecutive_steps_along_knife_normal()
+    test_parallel_stack_is_zero_then_spike()
+    test_diagonal_perpendicular_captures_more_than_face()
     print("geometry checks passed")

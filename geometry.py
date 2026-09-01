@@ -191,6 +191,40 @@ def convex_volume(points: np.ndarray) -> float:
     return float(max(hull.volume, 0.0))
 
 
+AABB_EDGES = (
+    (0, 1), (2, 3), (4, 5), (6, 7),
+    (0, 2), (1, 3), (4, 6), (5, 7),
+    (0, 4), (1, 5), (2, 6), (3, 7),
+)
+
+
+def aabb_slab_points(box: OrientedBox, normal: np.ndarray, midplane: float,
+                     thickness: float) -> np.ndarray:
+    """Vertices of an axis-aligned box clipped to |x·n - midplane| <= thickness/2."""
+    n = np.asarray(normal, dtype=float)
+    n = n / np.linalg.norm(n)
+    verts = box.vertices()
+    half = float(thickness) / 2.0
+    d = verts @ n - midplane
+    kept = [verts[i] for i in range(len(verts)) if abs(d[i]) <= half + 1e-12]
+    for i, j in AABB_EDGES:
+        da, db = d[i], d[j]
+        a, b = verts[i], verts[j]
+        for plane in (half, -half):
+            if (da - plane) * (db - plane) < 0.0:
+                w = (plane - da) / (db - da)
+                kept.append(a + w * (b - a))
+    if not kept:
+        return np.empty((0, 3))
+    pts = np.unique(np.round(np.asarray(kept, dtype=float), 10), axis=0)
+    return pts
+
+
+def aabb_slab_volume(box: OrientedBox, normal: np.ndarray, midplane: float,
+                     thickness: float) -> float:
+    return convex_volume(aabb_slab_points(box, normal, midplane, thickness))
+
+
 def intersection_volume(box_a: OrientedBox, box_b: OrientedBox) -> float:
     return convex_volume(intersection_vertices(box_a, box_b))
 
@@ -239,9 +273,11 @@ class ConsecutiveCut:
     """One slab in a serial stack stepped along the knife normal."""
 
     index: int
+    number: int
     midplane: float
     tissue_volume: float
     target_volume: float
+    pct_of_target: float
     is_current: bool
 
 
@@ -264,27 +300,40 @@ def consecutive_cuts(
     proj = tissue.vertices() @ n
     lo, hi = float(proj.min()), float(proj.max())
     p0 = float(np.dot(pivot, n))
-    k_lo = max(int(np.floor((lo - t / 2.0 - p0) / t)) - 1, -15)
-    k_hi = min(int(np.ceil((hi + t / 2.0 - p0) / t)) + 1, 15)
-    cuts: list[ConsecutiveCut] = []
+    k_lo = int(np.floor((lo - t / 2.0 - p0) / t))
+    k_hi = int(np.ceil((hi + t / 2.0 - p0) / t))
+    target_vol = target.volume if target is not None else 0.0
+    raw: list[tuple[int, float, float, float]] = []
     for k in range(k_lo, k_hi + 1):
-        center = pivot + k * t * n
-        slab = calculation_slab(t, rx, ry, rz, center)
-        v_tissue = intersection_volume(slab, tissue)
+        p = p0 + k * t
+        if p + t / 2.0 < lo - 1e-12 or p - t / 2.0 > hi + 1e-12:
+            continue
+        v_tissue = aabb_slab_volume(tissue, n, p, t)
         if v_tissue <= 1e-12 and k != 0:
             continue
-        v_target = intersection_volume(slab, target) if target is not None else 0.0
-        v_target = min(v_target, v_tissue)
+        if target is None:
+            v_target = 0.0
+        else:
+            tproj = target.vertices() @ n
+            if tproj.max() < p - t / 2.0 - 1e-12 or tproj.min() > p + t / 2.0 + 1e-12:
+                v_target = 0.0
+            else:
+                v_target = min(aabb_slab_volume(target, n, p, t), v_tissue)
+        raw.append((k, p, v_tissue, v_target))
+    raw.sort(key=lambda row: row[0])
+    cuts: list[ConsecutiveCut] = []
+    for number, (k, p, v_tissue, v_target) in enumerate(raw, start=1):
         cuts.append(
             ConsecutiveCut(
                 index=k,
-                midplane=p0 + k * t,
+                number=number,
+                midplane=p,
                 tissue_volume=v_tissue,
                 target_volume=v_target,
+                pct_of_target=(100.0 * v_target / target_vol) if target_vol else 0.0,
                 is_current=(k == 0),
             )
         )
-    cuts.sort(key=lambda c: c.index)
     return cuts
 
 
@@ -303,16 +352,21 @@ def compute_volumes(
     section_size = np.asarray(section_size, dtype=float)
     thickness = float(section_size[2])
     display = section_box(section_size, rx, ry, rz, pivot=pivot)
-    slab = calculation_slab(thickness, rx, ry, rz, pivot=pivot)
 
-    v_section = intersection_volume(slab, tissue)
-    v_target_cap = intersection_volume(slab, target) if target is not None else 0.0
-    v_target_cap = min(v_target_cap, v_section)
+    n = knife_normal(rx, ry, rz)
+    p0 = float(np.dot(np.asarray(pivot, dtype=float).reshape(3), n))
+    v_section = aabb_slab_volume(tissue, n, p0, thickness)
+    if target is None:
+        v_target_cap = 0.0
+        overlap_pts = np.empty((0, 3))
+        v_target_block = 0.0
+    else:
+        v_target_cap = min(aabb_slab_volume(target, n, p0, thickness), v_section)
+        overlap_pts = aabb_slab_points(target, n, p0, thickness)
+        v_target_block = target.volume
+    tissue_cut_pts = aabb_slab_points(tissue, n, p0, thickness)
     v_display = display.volume
     v_display_tissue = intersection_volume(display, tissue)
-    v_empty_display = max(v_display - v_display_tissue, 0.0)
-    v_target_block = target.volume if target is not None else 0.0
-
     volumes = SceneVolumes(
         section=v_section,
         tissue_in_section=v_section,
@@ -321,10 +375,8 @@ def compute_volumes(
         tissue_block=tissue.volume,
         target_block=v_target_block,
         display_volume=v_display,
-        empty_in_display=v_empty_display,
+        empty_in_display=max(v_display - v_display_tissue, 0.0),
     )
-    overlap_pts = intersection_vertices(slab, target) if target is not None else np.empty((0, 3))
-    tissue_cut_pts = intersection_vertices(slab, tissue)
     stack = consecutive_cuts(
         cube_size, target_size, depth_from_top, thickness, rx, ry, rz, pivot
     )
