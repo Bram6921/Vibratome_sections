@@ -14,12 +14,22 @@ import plotly.graph_objects as go
 from dash import Dash, Input, Output, State, callback_context, dcc, html, no_update
 from scipy.spatial import ConvexHull, QhullError
 
-from geometry import OrientedBox, compute_volumes, knife_normal
+from geometry import (
+    OrientedBox,
+    SceneDraw,
+    TissueBlock,
+    TARGET_CUBOID,
+    TARGET_FOLLOW,
+    compute_volumes,
+    knife_normal,
+    tissue_box,
+)
 
 DEFAULTS = {
     "cube_x": 3.0,
     "cube_y": 3.0,
     "cube_z": 3.0,
+    "curve_offset": 0.0,
     "target_x": 3.0,
     "target_y": 3.0,
     "target_z": 0.2,
@@ -64,6 +74,7 @@ CONTROLS = [
     ("cube_x", "Cube X", "mm", 0.2, 15.0, 0.1, DEFAULTS["cube_x"]),
     ("cube_y", "Cube Y", "mm", 0.2, 15.0, 0.1, DEFAULTS["cube_y"]),
     ("cube_z", "Cube Z", "mm", 0.2, 15.0, 0.1, DEFAULTS["cube_z"]),
+    ("curve_offset", "Apex / nadir offset from cube top", "mm", 0.0, 3.0, 0.01, DEFAULTS["curve_offset"]),
     ("target_x", "Target X", "mm", 0.1, 15.0, 0.1, DEFAULTS["target_x"]),
     ("target_y", "Target Y", "mm", 0.1, 15.0, 0.1, DEFAULTS["target_y"]),
     ("target_z", "Target thickness", "mm", 0.01, 5.0, 0.01, DEFAULTS["target_z"]),
@@ -144,23 +155,165 @@ def _poly_mesh(points: np.ndarray, color: str, name: str, opacity: float) -> go.
     )
 
 
-def build_figure(tissue: OrientedBox, target: OrientedBox | None, section: OrientedBox,
-                 overlap_pts: np.ndarray, tissue_cut_pts: np.ndarray, pivot: np.ndarray) -> go.Figure:
+def _tri_mesh(mesh, color: str, name: str, opacity: float) -> go.Mesh3d | None:
+    if mesh is None or mesh.is_empty():
+        return None
+    i, j, k = mesh.faces.T
+    return go.Mesh3d(
+        x=mesh.vertices[:, 0],
+        y=mesh.vertices[:, 1],
+        z=mesh.vertices[:, 2],
+        i=i,
+        j=j,
+        k=k,
+        color=color,
+        opacity=opacity,
+        name=name,
+        showlegend=True,
+        hovertemplate=f"{name}<extra></extra>",
+        flatshading=True,
+    )
+
+
+def _surface(xyz, color: str, name: str, opacity: float) -> go.Surface:
+    X, Y, Z = xyz
+    return go.Surface(
+        x=X,
+        y=Y,
+        z=Z,
+        colorscale=[[0, color], [1, color]],
+        showscale=False,
+        opacity=opacity,
+        name=name,
+        showlegend=True,
+        hovertemplate=f"{name}<extra></extra>",
+        lighting=dict(ambient=0.72, diffuse=0.4, specular=0.05),
+        contours=dict(x=dict(show=False), y=dict(show=False), z=dict(show=False)),
+    )
+
+
+def _wall_strip(xs, ys, z_top, z_bot, color: str, name: str) -> go.Mesh3d:
+    xs = np.asarray(xs, dtype=float).ravel()
+    ys = np.asarray(ys, dtype=float).ravel()
+    z_top = np.asarray(z_top, dtype=float).ravel()
+    n = xs.size
+    verts = np.column_stack(
+        [
+            np.concatenate([xs, xs]),
+            np.concatenate([ys, ys]),
+            np.concatenate([np.full(n, z_bot), z_top]),
+        ]
+    )
+    faces = []
+    for i in range(n - 1):
+        faces.append([i, i + 1, n + i + 1])
+        faces.append([i, n + i + 1, n + i])
+    faces = np.asarray(faces, dtype=int)
+    return go.Mesh3d(
+        x=verts[:, 0],
+        y=verts[:, 1],
+        z=verts[:, 2],
+        i=faces[:, 0],
+        j=faces[:, 1],
+        k=faces[:, 2],
+        color=color,
+        opacity=0.12,
+        name=name,
+        showlegend=False,
+        hoverinfo="skip",
+        flatshading=True,
+    )
+
+
+def _tissue_side_traces(xyz, z_bot: float) -> list:
+    X, Y, Z = xyz
+    return [
+        _wall_strip(X[0, :], Y[0, :], Z[0, :], z_bot, CUBE_COLOR, "wall"),
+        _wall_strip(X[-1, :], Y[-1, :], Z[-1, :], z_bot, CUBE_COLOR, "wall"),
+        _wall_strip(X[:, 0], Y[:, 0], Z[:, 0], z_bot, CUBE_COLOR, "wall"),
+        _wall_strip(X[:, -1], Y[:, -1], Z[:, -1], z_bot, CUBE_COLOR, "wall"),
+    ]
+
+
+def _dropdown(control_id: str, label: str, options: list[dict], value: str) -> html.Div:
+    return html.Div(
+        className="control-row",
+        children=[
+            html.Label(label, htmlFor=control_id, className="control-label"),
+            dcc.Dropdown(
+                id=control_id,
+                options=options,
+                value=value,
+                clearable=False,
+                className="param-dropdown",
+            ),
+        ],
+    )
+
+
+def build_figure(
+    tissue: OrientedBox,
+    target: OrientedBox | None,
+    section: OrientedBox,
+    overlap_pts: np.ndarray,
+    tissue_cut_pts: np.ndarray,
+    pivot: np.ndarray,
+    draw: SceneDraw,
+    cube_size,
+) -> go.Figure:
+    cube = tissue_box(cube_size)
     traces: list = [
-        _mesh3d(tissue, CUBE_COLOR, "Tissue cube", 0.08),
-        _wireframe(tissue, CUBE_COLOR, "cube-edges", 4.0),
         _mesh3d(section, SECTION_COLOR, "Display cuboid (not used in volumes)", 0.08),
         _wireframe(section, SECTION_COLOR, "section-edges", 2.0),
+        _wireframe(cube, "#94a3b8", "original-cube", 3.0),
     ]
-    cut = _poly_mesh(tissue_cut_pts, TISSUE_CUT_COLOR, "Tissue in this cut", 0.55)
+    curved = draw.tissue_top_xyz is not None
+    if curved:
+        traces.append(_surface(draw.tissue_top_xyz, CUBE_COLOR, "Tissue top", 0.28))
+        z_bot = -0.5 * float(np.asarray(cube_size)[2])
+        traces.extend(_tissue_side_traces(draw.tissue_top_xyz, z_bot=z_bot))
+        hx, hy = 0.5 * float(cube_size[0]), 0.5 * float(cube_size[1])
+        traces.append(
+            go.Mesh3d(
+                x=[-hx, hx, hx, -hx],
+                y=[-hy, -hy, hy, hy],
+                z=[z_bot, z_bot, z_bot, z_bot],
+                i=[0, 0],
+                j=[1, 2],
+                k=[2, 3],
+                color=CUBE_COLOR,
+                opacity=0.12,
+                name="Tissue bottom",
+                showlegend=False,
+                hoverinfo="skip",
+                flatshading=True,
+            )
+        )
+    else:
+        traces.append(_mesh3d(tissue, CUBE_COLOR, "Tissue cube", 0.08))
+        traces.append(_wireframe(tissue, CUBE_COLOR, "cube-edges", 4.0))
+
+    cut = _tri_mesh(draw.cut_mesh, TISSUE_CUT_COLOR, "Tissue in this cut", 0.55)
+    if cut is None:
+        cut = _poly_mesh(tissue_cut_pts, TISSUE_CUT_COLOR, "Tissue in this cut", 0.55)
     if cut is not None:
         traces.append(cut)
-    if target is not None:
+
+    follow = draw.target_mode == TARGET_FOLLOW and draw.target_top_xyz is not None
+    if follow:
+        traces.append(_surface(draw.target_top_xyz, TARGET_COLOR, "Target (follows top)", 0.5))
+        if draw.target_bot_xyz is not None:
+            traces.append(_surface(draw.target_bot_xyz, TARGET_COLOR, "Target underside", 0.35))
+    elif target is not None:
         traces.append(_mesh3d(target, TARGET_COLOR, "Target region", 0.35))
         traces.append(_wireframe(target, TARGET_COLOR, "target-edges", 3.0))
-    overlap = _poly_mesh(overlap_pts, OVERLAP_COLOR, "Target in this cut", 0.92)
+
+    overlap = _tri_mesh(draw.overlap_mesh, OVERLAP_COLOR, "Target in this cut", 0.92)
+    if overlap is None:
+        overlap = _poly_mesh(overlap_pts, OVERLAP_COLOR, "Target in this cut", 0.92)
     if overlap is not None:
         traces.append(overlap)
+
     pivot = np.asarray(pivot, dtype=float).reshape(3)
     traces.append(
         go.Scatter3d(
@@ -176,11 +329,14 @@ def build_figure(tissue: OrientedBox, target: OrientedBox | None, section: Orien
         )
     )
 
-    all_pts = [tissue.vertices(), section.vertices(), pivot.reshape(1, 3)]
+    all_pts = [cube.vertices(), tissue.vertices(), section.vertices(), pivot.reshape(1, 3)]
     if target is not None:
         all_pts.append(target.vertices())
+    if draw.tissue_top_xyz is not None:
+        X, Y, Z = draw.tissue_top_xyz
+        all_pts.append(np.column_stack([X.ravel(), Y.ravel(), Z.ravel()]))
     pts = np.vstack(all_pts)
-    span = float(np.max(np.abs(pts))) * 2.0
+    span = float(np.nanmax(np.abs(pts))) * 2.0
     span = max(span, 1.0)
 
     fig = go.Figure(data=traces)
@@ -316,7 +472,8 @@ app.layout = html.Div(
                     "tissue. Display X/Y only draw a cuboid; they are not used in the volumes. "
                     "Consecutive cuts step along the knife normal (local Z) by one thickness. "
                     "(0, 0, 0) is the cube centre; +Z points toward the top face. "
-                    "At 0°, 0°, 0° the cut is parallel to the top. Rx = 90° or Ry = 90° is perpendicular."
+                    "The top face can stay flat or become a spherical / cylindrical cap (convex) or bowl (concave). "
+                    "At 0°, 0°, 0° the cut is parallel to the original top. Rx = 90° or Ry = 90° is perpendicular."
                 ),
             ],
         ),
@@ -348,11 +505,55 @@ app.layout = html.Div(
                             ],
                         ),
                         html.H2("Tissue cube"),
+                        _dropdown(
+                            "top-shape",
+                            "Top surface",
+                            [
+                                {"label": "Flat (original cube)", "value": "flat"},
+                                {"label": "Spherical convex (dome)", "value": "sphere_convex"},
+                                {"label": "Spherical concave (bowl)", "value": "sphere_concave"},
+                                {"label": "Cylindrical convex", "value": "cylinder_convex"},
+                                {"label": "Cylindrical concave", "value": "cylinder_concave"},
+                            ],
+                            "flat",
+                        ),
+                        html.P(
+                            "Convex: the centre of the top rises above the original cube top; the four top corners stay "
+                            "at the original z. Concave: the centre sinks below that plane; the corners stay put. "
+                            "The offset slider is that centre height (convex) or depth (concave). "
+                            "Cylindrical shapes bend in only one horizontal direction.",
+                            className="hint",
+                        ),
                         _slider_input(*CONTROL_BY_ID["cube_x"]),
                         _slider_input(*CONTROL_BY_ID["cube_y"]),
                         _slider_input(*CONTROL_BY_ID["cube_z"]),
+                        _slider_input(*CONTROL_BY_ID["curve_offset"]),
+                        _dropdown(
+                            "cylinder-axis",
+                            "Cylinder axis (cylindrical tops only)",
+                            [
+                                {"label": "Along Y (bends in X)", "value": "y"},
+                                {"label": "Along X (bends in Y)", "value": "x"},
+                            ],
+                            "y",
+                        ),
                         html.H2("Target region"),
-                        html.P("Parallel to the top face, centred in X and Y, measured down from the top.", className="hint"),
+                        _dropdown(
+                            "target-mode",
+                            "Target geometry",
+                            [
+                                {"label": "Cuboid (parallel to XY, depth from the original flat top)", "value": "cuboid"},
+                                {"label": "Follow the top surface (parallel shell along the surface normal)", "value": "follow_surface"},
+                            ],
+                            "cuboid",
+                        ),
+                        html.P(
+                            "Follow mode offsets the top inward along its surface normal by the chosen depth, then "
+                            "again by the target thickness, so the target is a parallel shell (constant thickness "
+                            "along the normal, not along Z). A horizontal knife then hits that shell over several "
+                            "consecutive cuts. Cuboid mode keeps the original box; a concave top can clip it.",
+                            className="hint",
+                        ),
                         _slider_input(*CONTROL_BY_ID["target_x"]),
                         _slider_input(*CONTROL_BY_ID["target_y"]),
                         _slider_input(*CONTROL_BY_ID["target_z"]),
@@ -399,10 +600,10 @@ app.layout = html.Div(
                         html.P(
                             "The graph under the 3D view shows every serial cut through the tissue at this orientation. "
                             "Y is the absolute volume of the target region inside that tissue-clipped slab (mm³). "
-                            "Parallel cuts stay near zero until they reach the target layer, then spike. "
-                            "Face-on perpendicular cuts are almost flat. A 45° rotation about Z lengthens the cut "
-                            "through the layer, so the middle of that stack is higher; it is not perfectly flat, "
-                            "because the chord through the square is shorter near the corners.",
+                            "On a flat block, parallel cuts stay near zero until they reach the target layer, then spike. "
+                            "If the target follows a curved top, that spike spreads over more consecutive cuts and the "
+                            "peak per cut is lower. Face-on perpendicular cuts stay a thin strip; curvature mainly "
+                            "wiggles that strip in Z.",
                             className="hint",
                         ),
                         html.Div(id="stack-table"),
@@ -451,6 +652,7 @@ app.index_string = """
   .control-row { margin-bottom: 8px; }
   .control-label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 2px; }
   .slider-input { display: grid; grid-template-columns: 1fr 84px; gap: 8px; align-items: center; }
+  .param-dropdown { font-size: 13px; margin-bottom: 4px; }
   .param-input { width: 100%; box-sizing: border-box; padding: 6px 8px; border: 1px solid var(--line);
     border-radius: 6px; font-size: 13px; }
   .presets { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
@@ -508,9 +710,15 @@ for spec in CONTROLS:
     _sync_callback(spec[0])
 
 
-PRESET_OUTPUTS = [
-    Output(f"{c[0]}-slider", "value", allow_duplicate=True) for c in CONTROLS
-] + [Output(f"{c[0]}-input", "value", allow_duplicate=True) for c in CONTROLS]
+PRESET_OUTPUTS = (
+    [Output(f"{c[0]}-slider", "value", allow_duplicate=True) for c in CONTROLS]
+    + [Output(f"{c[0]}-input", "value", allow_duplicate=True) for c in CONTROLS]
+    + [
+        Output("top-shape", "value", allow_duplicate=True),
+        Output("cylinder-axis", "value", allow_duplicate=True),
+        Output("target-mode", "value", allow_duplicate=True),
+    ]
+)
 
 
 def _angle_outputs():
@@ -542,7 +750,7 @@ def _pivot_outputs():
 )
 def apply_default_preset(_n):
     slider_vals = [DEFAULTS[c[0]] for c in CONTROLS]
-    return slider_vals + slider_vals
+    return slider_vals + slider_vals + ["flat", "y", "cuboid"]
 
 
 @app.callback(
@@ -572,19 +780,34 @@ def apply_angle_preset(_x, _y, _z45, _o):
     _pivot_outputs(),
     Input("preset-pivot-centre", "n_clicks"),
     Input("preset-pivot-target", "n_clicks"),
+    State("cube_x-slider", "value"),
+    State("cube_y-slider", "value"),
     State("cube_z-slider", "value"),
     State("target_z-slider", "value"),
     State("target_depth-slider", "value"),
+    State("curve_offset-slider", "value"),
+    State("top-shape", "value"),
+    State("cylinder-axis", "value"),
+    State("target-mode", "value"),
     prevent_initial_call=True,
 )
-def apply_pivot_preset(_centre, _target, cube_z, target_z, depth):
+def apply_pivot_preset(
+    _centre, _target, cube_x, cube_y, cube_z, target_z, depth, curve_offset, top_shape, cyl_axis, target_mode
+):
     triggered = callback_context.triggered_id
     px, py, pz = 0.0, 0.0, 0.0
     if triggered == "preset-pivot-target":
+        cube_x = float(cube_x if cube_x is not None else DEFAULTS["cube_x"])
+        cube_y = float(cube_y if cube_y is not None else DEFAULTS["cube_y"])
         cube_z = float(cube_z if cube_z is not None else DEFAULTS["cube_z"])
         target_z = float(target_z if target_z is not None else DEFAULTS["target_z"])
         depth = float(depth if depth is not None else DEFAULTS["target_depth"])
-        pz = cube_z / 2.0 - depth - target_z / 2.0
+        curve_offset = float(curve_offset if curve_offset is not None else 0.0)
+        block = TissueBlock((cube_x, cube_y, cube_z), top_shape or "flat", curve_offset, cyl_axis or "y")
+        if (target_mode or TARGET_CUBOID) == TARGET_FOLLOW and not block.is_flat:
+            pz = float(block.z_surface(0.0, 0.0)) - depth - target_z / 2.0
+        else:
+            pz = cube_z / 2.0 - depth - target_z / 2.0
     return px, py, pz, px, py, pz
 
 
@@ -627,11 +850,17 @@ def step_along_knife_normal(_neg, _pos, px, py, pz, thickness, rx, ry, rz):
     Output("extra-metrics", "children"),
     Output("stack-table", "children"),
     Output("stack-graph", "figure"),
-    [Input(f"{c[0]}-slider", "value") for c in CONTROLS],
+    Input("top-shape", "value"),
+    Input("cylinder-axis", "value"),
+    Input("target-mode", "value"),
+    *[Input(f"{c[0]}-slider", "value") for c in CONTROLS],
 )
-def update_scene(*values):
+def update_scene(top_shape, cylinder_axis, target_mode, *values):
     params = {spec[0]: float(val if val is not None else spec[6]) for spec, val in zip(CONTROLS, values)}
-    volumes, tissue, target, section, overlap_pts, tissue_cut_pts, stack = compute_volumes(
+    top_shape = top_shape or "flat"
+    cylinder_axis = cylinder_axis or "y"
+    target_mode = target_mode or TARGET_CUBOID
+    volumes, tissue, target, section, overlap_pts, tissue_cut_pts, stack, draw = compute_volumes(
         cube_size=(params["cube_x"], params["cube_y"], params["cube_z"]),
         target_size=(params["target_x"], params["target_y"], params["target_z"]),
         depth_from_top=params["target_depth"],
@@ -640,9 +869,22 @@ def update_scene(*values):
         ry=params["ry"],
         rz=params["rz"],
         pivot=(params["pivot_x"], params["pivot_y"], params["pivot_z"]),
+        top_shape=top_shape,
+        curve_offset=params["curve_offset"],
+        cylinder_axis=cylinder_axis,
+        target_mode=target_mode,
     )
     pivot = np.array([params["pivot_x"], params["pivot_y"], params["pivot_z"]])
-    fig = build_figure(tissue, target, section, overlap_pts, tissue_cut_pts, pivot)
+    fig = build_figure(
+        tissue,
+        target,
+        section,
+        overlap_pts,
+        tissue_cut_pts,
+        pivot,
+        draw,
+        (params["cube_x"], params["cube_y"], params["cube_z"]),
+    )
     stack_fig = build_stack_figure(stack)
 
     tissue_detail = (
@@ -659,6 +901,11 @@ def update_scene(*values):
         f"({volumes.empty_in_display:.4f} mm³ of that drawing lies outside the tissue)."
     )
     extra = [
+        html.Div(
+            f"Top surface: {top_shape.replace('_', ' ')}"
+            + (f", offset {params['curve_offset']:.2f} mm" if top_shape != "flat" else "")
+            + f". Target: {target_mode.replace('_', ' ')}."
+        ),
         html.Div(
             f"Other tissue in this cut (tissue minus target): {volumes.pct_other_tissue:.3f}% "
             f"({max(volumes.tissue_in_section - volumes.target_in_section, 0.0):.4f} mm³)"
