@@ -1,5 +1,5 @@
 """Geometry for an axis-aligned tissue block, a near-surface target slab,
-and a rotatable section cuboid about a movable pivot.
+and a vibratome section: an infinite knife slab clipped to the tissue.
 """
 
 from __future__ import annotations
@@ -106,9 +106,36 @@ def section_box(
     rz: float,
     pivot=(0.0, 0.0, 0.0),
 ) -> OrientedBox:
+    """Finite cuboid used only for drawing. Volumes use calculation_slab()."""
     return OrientedBox(
         center=np.asarray(pivot, dtype=float).reshape(3),
         size=np.asarray(section_size, dtype=float),
+        rotation=rotation_matrix_xyz(rx, ry, rz),
+    )
+
+
+# In-plane extent for the calculation slab: larger than any cube in the UI,
+# so the knife is effectively infinite and X/Y of the display cuboid drop out.
+SLAB_INPLANE = 80.0
+
+
+def knife_normal(rx: float, ry: float, rz: float) -> np.ndarray:
+    """Unit normal of the knife: local Z after Rx, Ry, Rz."""
+    n = rotation_matrix_xyz(rx, ry, rz)[:, 2]
+    return n / np.linalg.norm(n)
+
+
+def calculation_slab(
+    thickness: float,
+    rx: float,
+    ry: float,
+    rz: float,
+    pivot=(0.0, 0.0, 0.0),
+) -> OrientedBox:
+    """Infinite (numerically huge) slab of the given thickness, mid-plane at pivot."""
+    return OrientedBox(
+        center=np.asarray(pivot, dtype=float).reshape(3),
+        size=np.array([SLAB_INPLANE, SLAB_INPLANE, float(thickness)]),
         rotation=rotation_matrix_xyz(rx, ry, rz),
     )
 
@@ -170,12 +197,16 @@ def intersection_volume(box_a: OrientedBox, box_b: OrientedBox) -> float:
 
 @dataclass
 class SceneVolumes:
+    """Volumes in mm³. `section` is the tissue spanned by the knife slab."""
+
     section: float
     tissue_in_section: float
     target_in_section: float
     empty_in_section: float
     tissue_block: float
     target_block: float
+    display_volume: float
+    empty_in_display: float
 
     @property
     def pct_tissue(self) -> float:
@@ -203,6 +234,60 @@ class SceneVolumes:
         return 100.0 * self.tissue_in_section / self.tissue_block if self.tissue_block else 0.0
 
 
+@dataclass
+class ConsecutiveCut:
+    """One slab in a serial stack stepped along the knife normal."""
+
+    index: int
+    midplane: float
+    tissue_volume: float
+    target_volume: float
+    is_current: bool
+
+
+def consecutive_cuts(
+    cube_size,
+    target_size,
+    depth_from_top: float,
+    thickness: float,
+    rx: float,
+    ry: float,
+    rz: float,
+    pivot=(0.0, 0.0, 0.0),
+) -> list[ConsecutiveCut]:
+    """Serial sections with pitch = thickness, along the knife normal, covering the tissue."""
+    tissue = tissue_box(cube_size)
+    target = target_box(cube_size, target_size, depth_from_top)
+    n = knife_normal(rx, ry, rz)
+    t = float(thickness)
+    pivot = np.asarray(pivot, dtype=float).reshape(3)
+    proj = tissue.vertices() @ n
+    lo, hi = float(proj.min()), float(proj.max())
+    p0 = float(np.dot(pivot, n))
+    k_lo = max(int(np.floor((lo - t / 2.0 - p0) / t)) - 1, -15)
+    k_hi = min(int(np.ceil((hi + t / 2.0 - p0) / t)) + 1, 15)
+    cuts: list[ConsecutiveCut] = []
+    for k in range(k_lo, k_hi + 1):
+        center = pivot + k * t * n
+        slab = calculation_slab(t, rx, ry, rz, center)
+        v_tissue = intersection_volume(slab, tissue)
+        if v_tissue <= 1e-12 and k != 0:
+            continue
+        v_target = intersection_volume(slab, target) if target is not None else 0.0
+        v_target = min(v_target, v_tissue)
+        cuts.append(
+            ConsecutiveCut(
+                index=k,
+                midplane=p0 + k * t,
+                tissue_volume=v_tissue,
+                target_volume=v_target,
+                is_current=(k == 0),
+            )
+        )
+    cuts.sort(key=lambda c: c.index)
+    return cuts
+
+
 def compute_volumes(
     cube_size,
     target_size,
@@ -212,25 +297,35 @@ def compute_volumes(
     ry: float,
     rz: float,
     pivot=(0.0, 0.0, 0.0),
-) -> tuple[SceneVolumes, OrientedBox, OrientedBox | None, OrientedBox, np.ndarray]:
+) -> tuple[SceneVolumes, OrientedBox, OrientedBox | None, OrientedBox, np.ndarray, np.ndarray, list[ConsecutiveCut]]:
     tissue = tissue_box(cube_size)
     target = target_box(cube_size, target_size, depth_from_top)
-    section = section_box(section_size, rx, ry, rz, pivot=pivot)
+    section_size = np.asarray(section_size, dtype=float)
+    thickness = float(section_size[2])
+    display = section_box(section_size, rx, ry, rz, pivot=pivot)
+    slab = calculation_slab(thickness, rx, ry, rz, pivot=pivot)
 
-    v_section = section.volume
-    v_tissue_cap = intersection_volume(section, tissue)
-    v_target_cap = intersection_volume(section, target) if target is not None else 0.0
-    v_target_cap = min(v_target_cap, v_tissue_cap)
-    v_empty = max(v_section - v_tissue_cap, 0.0)
+    v_section = intersection_volume(slab, tissue)
+    v_target_cap = intersection_volume(slab, target) if target is not None else 0.0
+    v_target_cap = min(v_target_cap, v_section)
+    v_display = display.volume
+    v_display_tissue = intersection_volume(display, tissue)
+    v_empty_display = max(v_display - v_display_tissue, 0.0)
     v_target_block = target.volume if target is not None else 0.0
 
     volumes = SceneVolumes(
         section=v_section,
-        tissue_in_section=v_tissue_cap,
+        tissue_in_section=v_section,
         target_in_section=v_target_cap,
-        empty_in_section=v_empty,
+        empty_in_section=0.0,
         tissue_block=tissue.volume,
         target_block=v_target_block,
+        display_volume=v_display,
+        empty_in_display=v_empty_display,
     )
-    overlap_pts = intersection_vertices(section, target) if target is not None else np.empty((0, 3))
-    return volumes, tissue, target, section, overlap_pts
+    overlap_pts = intersection_vertices(slab, target) if target is not None else np.empty((0, 3))
+    tissue_cut_pts = intersection_vertices(slab, tissue)
+    stack = consecutive_cuts(
+        cube_size, target_size, depth_from_top, thickness, rx, ry, rz, pivot
+    )
+    return volumes, tissue, target, display, overlap_pts, tissue_cut_pts, stack

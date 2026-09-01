@@ -9,13 +9,12 @@ Then open http://127.0.0.1:8050
 
 from __future__ import annotations
 
-import dash
 import numpy as np
 import plotly.graph_objects as go
 from dash import Dash, Input, Output, State, callback_context, dcc, html, no_update
 from scipy.spatial import ConvexHull, QhullError
 
-from geometry import OrientedBox, compute_volumes
+from geometry import OrientedBox, compute_volumes, knife_normal
 
 DEFAULTS = {
     "cube_x": 3.0,
@@ -57,6 +56,7 @@ BOX_EDGES = [
 CUBE_COLOR = "#4b5563"
 TARGET_COLOR = "#dc2626"
 SECTION_COLOR = "#2563eb"
+TISSUE_CUT_COLOR = "#0f766e"
 OVERLAP_COLOR = "#f59e0b"
 PIVOT_COLOR = "#111827"
 
@@ -68,9 +68,9 @@ CONTROLS = [
     ("target_y", "Target Y", "mm", 0.1, 15.0, 0.1, DEFAULTS["target_y"]),
     ("target_z", "Target thickness", "mm", 0.01, 5.0, 0.01, DEFAULTS["target_z"]),
     ("target_depth", "Target depth from top", "mm", 0.0, 10.0, 0.01, DEFAULTS["target_depth"]),
-    ("section_x", "Section X", "mm", 0.1, 20.0, 0.1, DEFAULTS["section_x"]),
-    ("section_y", "Section Y", "mm", 0.1, 20.0, 0.1, DEFAULTS["section_y"]),
-    ("section_z", "Section thickness", "mm", 0.01, 5.0, 0.01, DEFAULTS["section_z"]),
+    ("section_x", "Display X (visualization only)", "mm", 0.1, 20.0, 0.1, DEFAULTS["section_x"]),
+    ("section_y", "Display Y (visualization only)", "mm", 0.1, 20.0, 0.1, DEFAULTS["section_y"]),
+    ("section_z", "Knife thickness", "mm", 0.01, 5.0, 0.01, DEFAULTS["section_z"]),
     ("pivot_x", "Pivot X", "mm", -10.0, 10.0, 0.01, DEFAULTS["pivot_x"]),
     ("pivot_y", "Pivot Y", "mm", -10.0, 10.0, 0.01, DEFAULTS["pivot_y"]),
     ("pivot_z", "Pivot Z", "mm", -10.0, 10.0, 0.01, DEFAULTS["pivot_z"]),
@@ -120,7 +120,7 @@ def _wireframe(box: OrientedBox, color: str, name: str, width: float = 3.0) -> g
     )
 
 
-def _overlap_mesh(points: np.ndarray) -> go.Mesh3d | None:
+def _poly_mesh(points: np.ndarray, color: str, name: str, opacity: float) -> go.Mesh3d | None:
     if points.shape[0] < 4:
         return None
     try:
@@ -135,27 +135,30 @@ def _overlap_mesh(points: np.ndarray) -> go.Mesh3d | None:
         i=i,
         j=j,
         k=k,
-        color=OVERLAP_COLOR,
-        opacity=0.92,
-        name="Section ∩ target",
+        color=color,
+        opacity=opacity,
+        name=name,
         showlegend=True,
-        hovertemplate="Section ∩ target<extra></extra>",
+        hovertemplate=f"{name}<extra></extra>",
         flatshading=True,
     )
 
 
 def build_figure(tissue: OrientedBox, target: OrientedBox | None, section: OrientedBox,
-                 overlap_pts: np.ndarray, pivot: np.ndarray) -> go.Figure:
+                 overlap_pts: np.ndarray, tissue_cut_pts: np.ndarray, pivot: np.ndarray) -> go.Figure:
     traces: list = [
         _mesh3d(tissue, CUBE_COLOR, "Tissue cube", 0.08),
         _wireframe(tissue, CUBE_COLOR, "cube-edges", 4.0),
-        _mesh3d(section, SECTION_COLOR, "Section", 0.22),
-        _wireframe(section, SECTION_COLOR, "section-edges", 3.0),
+        _mesh3d(section, SECTION_COLOR, "Display cuboid (not used in volumes)", 0.08),
+        _wireframe(section, SECTION_COLOR, "section-edges", 2.0),
     ]
+    cut = _poly_mesh(tissue_cut_pts, TISSUE_CUT_COLOR, "Tissue in this cut", 0.55)
+    if cut is not None:
+        traces.append(cut)
     if target is not None:
-        traces.append(_mesh3d(target, TARGET_COLOR, "Target region", 0.45))
+        traces.append(_mesh3d(target, TARGET_COLOR, "Target region", 0.35))
         traces.append(_wireframe(target, TARGET_COLOR, "target-edges", 3.0))
-    overlap = _overlap_mesh(overlap_pts)
+    overlap = _poly_mesh(overlap_pts, OVERLAP_COLOR, "Target in this cut", 0.92)
     if overlap is not None:
         traces.append(overlap)
     pivot = np.asarray(pivot, dtype=float).reshape(3)
@@ -266,11 +269,11 @@ app.layout = html.Div(
             children=[
                 html.H1("Tissue section geometry"),
                 html.P(
-                    "The section cuboid is centred on a movable pivot. "
-                    "Rotations are Rx then Ry then Rz about that point. "
+                    "A vibratome section is a knife slab as thick as you set, extended in-plane until it leaves the "
+                    "tissue. Display X/Y only draw a cuboid; they are not used in the volumes. "
+                    "Consecutive cuts step along the knife normal (local Z) by one thickness. "
                     "(0, 0, 0) is the cube centre; +Z points toward the top face. "
-                    "At 0°, 0°, 0° the section is parallel to the top face. "
-                    "A perpendicular (vertical) cut is Rx = 90° or Ry = 90°."
+                    "At 0°, 0°, 0° the cut is parallel to the top. Rx = 90° or Ry = 90° is perpendicular."
                 ),
             ],
         ),
@@ -293,6 +296,8 @@ app.layout = html.Div(
                                 html.Button("Oblique 45°", id="preset-oblique", n_clicks=0),
                                 html.Button("Pivot on target", id="preset-pivot-target", n_clicks=0),
                                 html.Button("Pivot at cube centre", id="preset-pivot-centre", n_clicks=0),
+                                html.Button("Previous cut (−thickness along normal)", id="step-normal-neg", n_clicks=0),
+                                html.Button("Next cut (+thickness along normal)", id="step-normal-pos", n_clicks=0),
                             ],
                         ),
                         html.H2("Tissue cube"),
@@ -306,13 +311,19 @@ app.layout = html.Div(
                         _slider_input(*CONTROL_BY_ID["target_z"]),
                         _slider_input(*CONTROL_BY_ID["target_depth"]),
                         html.H2("Section"),
-                        html.P("Thickness is the local Z side length before rotation.", className="hint"),
+                        html.P(
+                            "Knife thickness is the only in-plane-independent size used for volumes. "
+                            "Display X and Y are the drawn cuboid only.",
+                            className="hint",
+                        ),
                         _slider_input(*CONTROL_BY_ID["section_x"]),
                         _slider_input(*CONTROL_BY_ID["section_y"]),
                         _slider_input(*CONTROL_BY_ID["section_z"]),
                         html.H2("Rotation pivot"),
                         html.P(
-                            "Section centre and rotation point, in millimetres from the cube centre.",
+                            "Mid-plane of this cut, in millimetres from the cube centre. "
+                            "Only the component along the knife normal changes which tissue is cut. "
+                            "Use Previous/Next cut to step a full thickness along that normal.",
                             className="hint",
                         ),
                         _slider_input(*CONTROL_BY_ID["pivot_x"]),
@@ -322,10 +333,11 @@ app.layout = html.Div(
                         _slider_input(*CONTROL_BY_ID["rx"]),
                         _slider_input(*CONTROL_BY_ID["ry"]),
                         _slider_input(*CONTROL_BY_ID["rz"]),
-                        html.H2("Volume inside the section"),
+                        html.H2("Volume inside this cut"),
                         html.P(
-                            "Percentages are of the section cuboid’s own volume. "
-                            "Target sits inside the tissue, so tissue + nothingness = 100%.",
+                            "Percentages are of the tissue spanned by the knife slab (what a vibratome actually yields). "
+                            "Nothingness is 0% because empty space outside the block is not part of the section. "
+                            "Absolute target millimetres cubed are the quantity to compare across orientations.",
                             className="hint",
                         ),
                         html.Div(
@@ -336,6 +348,13 @@ app.layout = html.Div(
                                 _pct_card("c) Nothingness", "pct-empty", "detail-empty", SECTION_COLOR),
                             ],
                         ),
+                        html.H2("Consecutive cuts along the knife normal"),
+                        html.P(
+                            "Same orientation, mid-planes spaced by one knife thickness. "
+                            "This cut is k = 0. Target mm³ is the absolute volume in that slab.",
+                            className="hint",
+                        ),
+                        html.Div(id="stack-table"),
                         html.Div(id="extra-metrics", className="extra-metrics"),
                     ],
                 ),
@@ -390,8 +409,10 @@ app.index_string = """
   .pct-title { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
   .pct-value { font-size: 28px; font-weight: 700; line-height: 1.15; margin: 2px 0; }
   .pct-detail, .extra-metrics { font-size: 12px; color: var(--muted); line-height: 1.4; }
-  .extra-metrics { margin-top: 10px; padding: 8px 10px; background: #f8fafc; border-radius: 8px;
-    border: 1px solid var(--line); }
+  .stack-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 4px; }
+  .stack-table th, .stack-table td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--line); }
+  .stack-table th { color: var(--muted); font-weight: 600; }
+  .stack-current td { font-weight: 700; color: var(--ink); background: #ecfdf5; }
   .js-plotly-plot .plotly .modebar { right: 8px !important; }
   @media (max-width: 980px) {
     .main { grid-template-columns: 1fr; }
@@ -511,6 +532,34 @@ def apply_pivot_preset(_centre, _target, cube_z, target_z, depth):
 
 
 @app.callback(
+    _pivot_outputs(),
+    Input("step-normal-neg", "n_clicks"),
+    Input("step-normal-pos", "n_clicks"),
+    State("pivot_x-slider", "value"),
+    State("pivot_y-slider", "value"),
+    State("pivot_z-slider", "value"),
+    State("section_z-slider", "value"),
+    State("rx-slider", "value"),
+    State("ry-slider", "value"),
+    State("rz-slider", "value"),
+    prevent_initial_call=True,
+)
+def step_along_knife_normal(_neg, _pos, px, py, pz, thickness, rx, ry, rz):
+    triggered = callback_context.triggered_id
+    px = float(px if px is not None else 0.0)
+    py = float(py if py is not None else 0.0)
+    pz = float(pz if pz is not None else 0.0)
+    thickness = float(thickness if thickness is not None else DEFAULTS["section_z"])
+    rx = float(rx if rx is not None else 0.0)
+    ry = float(ry if ry is not None else 0.0)
+    rz = float(rz if rz is not None else 0.0)
+    direction = -1.0 if triggered == "step-normal-neg" else 1.0
+    delta = direction * thickness * knife_normal(rx, ry, rz)
+    nx, ny, nz = px + delta[0], py + delta[1], pz + delta[2]
+    return nx, ny, nz, nx, ny, nz
+
+
+@app.callback(
     Output("scene", "figure"),
     Output("pct-tissue", "children"),
     Output("detail-tissue", "children"),
@@ -519,11 +568,12 @@ def apply_pivot_preset(_centre, _target, cube_z, target_z, depth):
     Output("pct-empty", "children"),
     Output("detail-empty", "children"),
     Output("extra-metrics", "children"),
+    Output("stack-table", "children"),
     [Input(f"{c[0]}-slider", "value") for c in CONTROLS],
 )
 def update_scene(*values):
     params = {spec[0]: float(val if val is not None else spec[6]) for spec, val in zip(CONTROLS, values)}
-    volumes, tissue, target, section, overlap_pts = compute_volumes(
+    volumes, tissue, target, section, overlap_pts, tissue_cut_pts, stack = compute_volumes(
         cube_size=(params["cube_x"], params["cube_y"], params["cube_z"]),
         target_size=(params["target_x"], params["target_y"], params["target_z"]),
         depth_from_top=params["target_depth"],
@@ -534,28 +584,58 @@ def update_scene(*values):
         pivot=(params["pivot_x"], params["pivot_y"], params["pivot_z"]),
     )
     pivot = np.array([params["pivot_x"], params["pivot_y"], params["pivot_z"]])
-    fig = build_figure(tissue, target, section, overlap_pts, pivot)
+    fig = build_figure(tissue, target, section, overlap_pts, tissue_cut_pts, pivot)
 
     tissue_detail = (
-        f"{volumes.tissue_in_section:.4f} mm³ of section  ·  "
+        f"{volumes.tissue_in_section:.4f} mm³ of tissue in this cut  ·  "
         f"{volumes.pct_tissue_captured:.3f}% of the {volumes.tissue_block:.4f} mm³ block"
     )
     target_detail = (
-        f"{volumes.target_in_section:.4f} mm³ of section  ·  "
+        f"{volumes.target_in_section:.4f} mm³ of target in this cut  ·  "
         f"{volumes.pct_target_captured:.3f}% of the {volumes.target_block:.4f} mm³ target"
     )
-    empty_detail = f"{volumes.empty_in_section:.4f} mm³ of the {volumes.section:.4f} mm³ section lies outside the tissue"
+    empty_detail = (
+        "0 mm³ of the real section is empty space. "
+        f"The display cuboid is {volumes.display_volume:.4f} mm³ "
+        f"({volumes.empty_in_display:.4f} mm³ of that drawing lies outside the tissue)."
+    )
     extra = [
-        html.Div(f"Other tissue in section (tissue minus target): {volumes.pct_other_tissue:.3f}%"),
         html.Div(
-            f"Check: tissue {volumes.pct_tissue:.3f}% + nothingness {volumes.pct_nothingness:.3f}% "
-            f"= {volumes.pct_tissue + volumes.pct_nothingness:.3f}%"
+            f"Other tissue in this cut (tissue minus target): {volumes.pct_other_tissue:.3f}% "
+            f"({max(volumes.tissue_in_section - volumes.target_in_section, 0.0):.4f} mm³)"
         ),
         html.Div(
             f"Pivot (mm): X={params['pivot_x']:.3f}, Y={params['pivot_y']:.3f}, Z={params['pivot_z']:.3f}. "
             f"Angles (deg): Rx={params['rx']:.2f}, Ry={params['ry']:.2f}, Rz={params['rz']:.2f}."
         ),
     ]
+    best = max(stack, key=lambda c: c.target_volume) if stack else None
+    if best is not None:
+        extra.append(
+            html.Div(
+                f"In this consecutive stack, the largest target in any one cut is {best.target_volume:.4f} mm³ "
+                f"(k = {best.index:+d}). This cut has {volumes.target_in_section:.4f} mm³."
+            )
+        )
+    stack_table = html.Table(
+        [
+            html.Thead(html.Tr([html.Th("Cut"), html.Th("Target (mm³)"), html.Th("Tissue (mm³)")])),
+            html.Tbody(
+                [
+                    html.Tr(
+                        [
+                            html.Td("this cut" if c.is_current else f"k = {c.index:+d}"),
+                            html.Td(f"{c.target_volume:.4f}"),
+                            html.Td(f"{c.tissue_volume:.4f}"),
+                        ],
+                        className="stack-current" if c.is_current else "",
+                    )
+                    for c in stack
+                ]
+            ),
+        ],
+        className="stack-table",
+    )
     return (
         fig,
         f"{volumes.pct_tissue:.3f}%",
@@ -565,6 +645,7 @@ def update_scene(*values):
         f"{volumes.pct_nothingness:.3f}%",
         empty_detail,
         extra,
+        stack_table,
     )
 
 
